@@ -16,17 +16,40 @@ DBG = '[profile.dev]\ndebug = "line-tables-only"\n[profile.dev.package."*"]\ndeb
 SPLIT = '[profile.dev]\ndebug = "line-tables-only"\nsplit-debuginfo = "unpacked"\n[profile.dev.package."*"]\ndebug = false\n'
 NOLLD = "-Clinker-features=-lld"
 MOLD = f"{NOLLD} -Clink-arg=-B{OUT}/moldbin"
-# name -> toml, rustflags, dynamic-std wrapper, build-dir kind, extra cargo args
+# name -> toml, rustflags, RUSTC_WRAPPER script (0 = none), build-dir kind, extra cargo args
 CFGS = {
     "baseline": ("", "", 0, None, []),
     "dbg": (DBG, "", 0, None, []),
     "split": (SPLIT, "", 0, None, []),  # default linker (rust-lld)
     "bfd": (SPLIT, NOLLD, 0, None, []),
     "mold": (SPLIT, MOLD, 0, None, []),
-    "dynrpath": (SPLIT, "", 1, None, []),
+    "dynrpath": (SPLIT, "", "rustc_wrap.sh", None, []),
     "builddir": (SPLIT, "", 0, "disk", []),
     "builddir_shm": (SPLIT, "", 0, "/dev/shm", []),
-    "depdylib": (SPLIT, "", 1, None, ["--features", "dylib"]),  # webapp only
+    "dyndeps": (SPLIT, "", "dyndeps_wrap.sh", None, []),  # transparent per-crate dependency dylibs
+    "depdylib": (SPLIT, "", "rustc_wrap.sh", None, ["--features", "dylib"]),  # webapp only
+}
+WILD = f"{NOLLD} -Clink-arg=-B{OUT}/wildbin"
+NIGHTLY = "nightly-2026-10-22-x86_64-unknown-linux-gnu"
+BOOT = {"RUSTC_BOOTSTRAP": "1"}  # unlock `-Z` flags on the pinned stable toolchain (unsupported by rustc, fine for measuring)
+NOINC = SPLIT.replace("[profile.dev]\n", "[profile.dev]\nincremental = false\n")
+NODBG = '[profile.dev]\ndebug = false\nsplit-debuginfo = "unpacked"\n'
+CFGS.update({
+    "wild": (SPLIT, WILD, 0, None, []),
+    "noembed": (SPLIT, "", 0, None, []),  # + -Zno-embed-metadata
+    "threads8": (SPLIT, "-Zthreads=8", 0, None, []),
+    "nodebug": (NODBG, "", 0, None, []),
+    "noinc": (NOINC, "", 0, None, []),
+    "combo_stable": (SPLIT, WILD, "dyndeps_wrap.sh", None, []),  # dyndeps + wild
+    "combo_boot": (SPLIT, f"{WILD} -Zthreads=8", "dyndeps_wrap.sh", None, []),  # + parallel frontend
+    "sccache": (SPLIT, "", "sccache", None, []),
+    "split_nightly": (SPLIT, "", 0, None, []),  # reference for `cranelift`
+    "cranelift": (SPLIT, "-Zcodegen-backend=cranelift", 0, None, []),
+})
+# cfg -> extra env; `TC` overrides the toolchain
+ENVX = {
+    "noembed": {**BOOT, "CARGO_UNSTABLE_NO_EMBED_METADATA": "true"}, "threads8": BOOT, "combo_boot": BOOT,
+    "split_nightly": {"TC": NIGHTLY}, "cranelift": {"TC": NIGHTLY},
 }
 # repo -> (cargo args, bin, run args, leaf file, wide file)
 REPOS = {
@@ -35,7 +58,11 @@ REPOS = {
     "rustls--rustls": (["-p", "rustls-examples"], "limitedclient", ["--help"], "examples/src/bin/limitedclient.rs", "rustls/src/lib.rs"),
     "webapp": (["-p", "app"], "app", ["--once"], "app/src/main.rs", None),
 }
-CARGO = subprocess.check_output(["rustup", "which", "cargo"], text=True, env={**os.environ, "RUSTUP_TOOLCHAIN": TC}).strip()
+
+
+def cargo_of(tc):
+    return subprocess.check_output(["rustup", "which", "cargo"], text=True, env={**os.environ, "RUSTUP_TOOLCHAIN": tc}).strip()
+
 
 
 def load1():
@@ -53,16 +80,20 @@ class Trial:
         self.toml, self.rf, self.dyn, bd, self.extra = CFGS[cfg]
         self.cargo_args, self.bin, self.run_args, self.leaf, self.wide = REPOS[repo]
         tag = f"{lane}.{repo}.{cfg}.{rep}"
-        self.src = f"{OUT}/repos/{repo}"
+        self.src = f"{OUT}/lanes/{lane}/{repo}"  # private copy per lane: lanes edit sources concurrently
         self.target = f"{OUT}/t/{tag}"
         self.bdir = None if bd is None else (f"{OUT}/bd/{tag}" if bd == "disk" else f"{bd}/rbe_{tag}")
         self.env = {
             "PATH": os.environ["PATH"], "HOME": os.environ["HOME"], "CARGO_HOME": f"{OUT}/cargo_home",
-            "RUSTUP_TOOLCHAIN": TC, "CARGO_TARGET_DIR": self.target, "CARGO_TERM_COLOR": "never",
+            "RUSTUP_TOOLCHAIN": ENVX.get(cfg, {}).get("TC", TC), "CARGO_TARGET_DIR": self.target, "CARGO_TERM_COLOR": "never",
             "CARGO_NET_OFFLINE": "true", "RUSTFLAGS": self.rf,
         }
-        if self.dyn:
-            self.env["RUSTC_WRAPPER"] = f"{HERE}/rustc_wrap.sh"
+        self.env.update({k: v for k, v in ENVX.get(cfg, {}).items() if k != "TC"})
+        self.cargo_bin = cargo_of(self.env["RUSTUP_TOOLCHAIN"])
+        if self.dyn == "sccache":
+            self.env.update(RUSTC_WRAPPER=shutil.which("sccache"), SCCACHE_DIR=f"{OUT}/sccache/{tag}")
+        elif self.dyn:
+            self.env["RUSTC_WRAPPER"] = f"{HERE}/{self.dyn}"
         self.flags = ["--offline", "--locked"]
         if self.toml:
             open(f"{OUT}/cfg/{cfg}.toml", "w").write(self.toml)
@@ -75,7 +106,7 @@ class Trial:
         self.csv.flush()
 
     def cargo(self, sub, extra=(), log=None):
-        cmd = [CARGO, sub, *self.cargo_args, *self.extra, *self.flags, *extra]
+        cmd = [self.cargo_bin, sub, *self.cargo_args, *self.extra, *self.flags, *extra]
         r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
         t0 = time.perf_counter()
         p = subprocess.run(cmd, cwd=self.src, env=self.env, capture_output=True, text=True, timeout=1800)
@@ -107,7 +138,7 @@ class Trial:
         finally:
             for f, s in orig.items():
                 open(f"{self.src}/{f}", "w").write(s)
-            for d in (self.target, self.bdir):
+            for d in (self.target, self.bdir, self.env.get("SCCACHE_DIR")):
                 if d:
                     shutil.rmtree(d, ignore_errors=True)
 
@@ -117,13 +148,21 @@ class Trial:
         if rc:
             return
         self.sizes("cold")
+        if self.cfg == "sccache":  # same cold build again with the now-warm cache
+            shutil.rmtree(self.target)
+            ms, cpu, rc = self.cargo("build")
+            self.rec("cold_hit_ms", ms), self.rec("cold_hit_rc", rc)
+            self.rec("size_coldhit_target_kb", du_kb(self.target))
         binp = f"{self.target}/debug/{self.bin}"
         self.rec("bin_bytes", os.path.getsize(binp))
         comment = subprocess.run(["readelf", "-p", ".comment", binp], capture_output=True, text=True).stdout
         self.rec("linker", "|".join(l.split("]")[-1].strip() for l in comment.splitlines() if "]" in l).replace(",", ";"))
         dyn = subprocess.run(["readelf", "-d", binp], capture_output=True, text=True).stdout
         self.rec("dyn_std", int("libstd-" in dyn))
-        ok = subprocess.run([binp, *self.run_args], cwd=self.src, env={"PATH": "/usr/bin:/bin"}, capture_output=True, timeout=20).returncode
+        try:
+            ok = subprocess.run([binp, *self.run_args], cwd=self.src, env={"PATH": "/usr/bin:/bin"}, capture_output=True, timeout=20).returncode
+        except subprocess.TimeoutExpired:
+            ok = 124  # hang
         self.rec("run_rc", ok)
         ms, cpu, rc = self.cargo("build")
         self.rec("noop_ms", ms)
@@ -139,8 +178,12 @@ class Trial:
                     self.rec(f"edit_{kind}_ms", ms), self.rec(f"edit_{kind}_cpu_s", cpu), self.rec(f"edit_{kind}_rc", rc)
         self.sizes("edited")
         if self.rep == 0:
-            ms, cpu, rc = self.cargo("test", ["--no-run"])
+            ms, cpu, rc = self.cargo("test", ["--no-run"], log=f"{OUT}/flags/{self.repo}.{self.cfg}.test.txt")
             self.rec("test_norun_ms", ms), self.rec("test_norun_rc", rc)
+            # load every test binary in a clean env (`--list` runs no tests): proves rpath/loader works
+            exes = [l.split("(")[-1].rstrip(")\n") for l in open(f"{OUT}/flags/{self.repo}.{self.cfg}.test.txt") if "Executable" in l]
+            bad = sum(subprocess.run([e, "--list"], env={"PATH": "/usr/bin:/bin"}, capture_output=True, timeout=60).returncode != 0 for e in exes)
+            self.rec("test_bins", len(exes)), self.rec("test_bins_load_fail", bad)
             self.sizes("test")
 
 
@@ -173,13 +216,21 @@ if __name__ == "__main__":
     lo, hi = map(int, cpus.split("-"))
     os.sched_setaffinity(0, set(range(lo, hi + 1)))
     os.makedirs(f"{OUT}/cfg", exist_ok=True)
-    trials = [(r, c, i) for r in repos if r in REPOS for c in CFGS if c != "depdylib" or r == "webapp" for i in range(reps)]
+    for r in repos:
+        if r in REPOS and not os.path.exists(f"{OUT}/lanes/{lane}/{r}"):
+            os.makedirs(f"{OUT}/lanes/{lane}", exist_ok=True)
+            subprocess.check_call(["cp", "-r", f"{OUT}/repos/{r}", f"{OUT}/lanes/{lane}/{r}"])
+    cfgs = os.environ.get("CFGS", "").split(",") if os.environ.get("CFGS") else list(CFGS)
+    trials = [(r, c, i) for r in repos if r in REPOS for c in cfgs if c != "depdylib" or r == "webapp" for i in range(int(os.environ.get("REP0", 0)), int(os.environ.get("REP0", 0)) + reps)]
     trials += [("PAIR", k, i) for k in ("pair_shared", "pair_sep") for i in range(reps) if "PAIR" in repos]
     random.Random(f"{lane}").shuffle(trials)
     os.makedirs(f"{HERE}/../data", exist_ok=True)
+    DONE = open(f"{HERE}/../data/raw_{lane}.csv").read() if os.path.exists(f"{HERE}/../data/raw_{lane}.csv") else ""
     only = os.environ.get("ONLY")  # smoke tests: comma list of repo:cfg
     with open(f"{HERE}/../data/raw_{lane}.csv", "a") as csv:
         for n, (r, c, i) in enumerate(trials):
+            if f"{lane},{r},{c},{i},size_edited_build_kb," in DONE:
+                continue  # resume after a crash: trial finished earlier
             if only and f"{r}:{c}" not in only.split(","):
                 continue
             print(f"{time.strftime('%H:%M:%S')} {n+1}/{len(trials)} {r} {c} {i} load={load1()}", flush=True)

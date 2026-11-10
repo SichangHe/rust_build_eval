@@ -12,8 +12,9 @@ Controlled evaluation of Cargo settings for artifact size and compile speed.
 ## Layout
 - `scripts/run.py`: harness (`run.py LANE LO-HI REPOS REPS`); config table inside
 - `scripts/rustc_wrap.sh`: `RUSTC_WRAPPER` shim for `dynrpath` / `depdylib`
+- `scripts/dyndeps_wrap.{py,sh}`: transparent per-crate dependency dylibs (`dyndeps`)
 - `scripts/analyze.py`: medians, bootstrap CIs, ratios vs `split`
-- `data/raw_*.csv`: raw long-format samples (lane,repo,config,rep,metric,value,load1)
+- `data/raw_*.csv`, `data/analysis_round{1,2}.txt`: raw long-format samples (lane,repo,config,rep,metric,value,load1)
 - `results.md`: results and threats to validity
 
 ## Reproduce
@@ -22,3 +23,4 @@ Controlled evaluation of Cargo settings for artifact size and compile speed.
 - `moldbin/ld` -> mold binary (`nix shell nixpkgs#mold`; gcc lacks `-fuse-ld=mold`, so `-B` shim dir)
 - repo copies: `git ls-files` of each source repo plus its `Cargo.lock`; `cargo fetch` once, all runs `--offline --locked`
 - `EVAL_OUT=... python3 scripts/run.py LANE LO-HI REPOS REPS`, then `python3 scripts/analyze.py data/raw_*.csv`
+- round 2 also needs `moldbin`-style `wildbin/ld` -> wild 0.10.0, nightly-2026-10-22 with `rustc-codegen-cranelift-preview`, `sccache`; `CFGS=a,b REP0=n` env limits configs and rep offset

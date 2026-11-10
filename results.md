@@ -87,3 +87,54 @@ debug = false
 - `depdylib` only on webapp, built by an earlier agent's facade design; `rustc_wrap.sh` adds flags to all crates incl. build scripts
 - shared `~/.cargo/registry` is symlinked (not read-only): `cargo fetch` for rustls/webapp added crates to it before the runs
 - `mold` came from a nix store path; the unified setup is not measured on other mold versions
+
+# Round 2: transparent dependency dylibs, and other options
+(authored by agents) Tables: `data/analysis_round2.txt`; raw: `data/raw_{D1,D2,E,F}.csv`. Round 1 above is unchanged. Same harness (`scripts/run.py`), all configs interleaved in one shuffled run, ratios vs `split` of the same round (not round 1 numbers). Reps: 5 trials per cell (teamtype 4: lanes D1+D2 x2), 20 edit samples; lanes pinned to disjoint 16-CPU ranges, load1 55-95. Each lane edits a private copy of the sources.
+
+## `dyndeps`: zero-edit dependency dylibs (works, but does not pay)
+Mechanism (`scripts/dyndeps_wrap.py`, via `RUSTC_WRAPPER`; no project edits, no Cargo.toml change):
+- every registry/git library crate is compiled as `lib` + `dylib` (extra `--crate-type dylib`, same `-Cextra-filename`, so `libX-hash.so` sits beside `libX-hash.rlib`)
+- each consumer gets `-Cprefer-dynamic`, rpath to the toolchain libdir and to `target/debug/deps`, and a second `--extern name=libX.so` beside every `.rlib/.rmeta`
+- cargo starts dependents when it sees the `metadata` artifact, but the `.so` is not linked yet: the wrapper buffers rustc's stderr and releases the `metadata` notice only at exit (the dylib twin costs wall time on the critical path)
+- fallbacks to plain static build: proc-macros, build scripts, workspace crates, crates with `static` native libs (`aws-lc-sys`: a dylib hides the bundled C symbols, link fails), crates where `dylib` fails (`#![no_std]`)
+- all 4 workloads: cold build ok, binary runs in a clean env, `cargo test --no-run` ok, every test binary loads (`--list`) in a clean env (0 failures); there is no source/manifest change. So "needs source changes" was an artifact of the facade design, not necessary.
+
+Measured (ratio vs `split`, 95% CI of ratio of medians):
+- leaf edit: agent_managers x1.066 [1.03,1.10], rustls x1.094 [1.03,1.15], teamtype x0.983 [0.92,1.03], webapp x0.945 [0.92,0.99]; teamtype wide x0.963 [0.93,1.00], rustls wide x1.055 [0.99,1.10]. So no real speedup (up to 9% slower, at best 5% faster)
+- cold build: x1.47 [1.34,1.54] agent_managers, x1.36 rustls, x1.44 teamtype, x1.77 webapp (every CI > 1): twin dylib builds plus held-back pipelining
+- app binary: x0.81 agent_managers, x0.65 rustls, x0.86 teamtype, x0.44 webapp; target dir x1.05-1.08 (agent_managers 1.07, rustls 0.97). Total deployable bytes grow because the `.so` files move bytes (as noted for `depdylib`)
+- `test --no-run` n=1 per cell: x0.95-1.18
+
+Why the earlier `depdylib` won (x0.79) but this loses: one facade `.so` = 1 link input and 1 dynamic object; `dyndeps` makes 90-570 `.so` files, so the linker/loader work per edit does not shrink (lld handles many rlibs fast, and `--gc-sections` over rlibs is cheap) while symbol-versioned dynamic relocation of 100s of libs adds work. Explanation is an inference; I did not profile `ld.so` or link time per config. Linker time share in the edit loop (`-Ztime-passes`, agent_managers, one edit): link 0.31 s of 1.07 s total; the rest is frontend/codegen/incremental-cache writing of the one crate, which dependency dylibs cannot touch.
+
+A facade (one `.so`) from the resolved graph is still possible from a wrapper (generate it into the target dir and rewrite `--extern`), but needs `use deps_dylib as _` for the linker to keep the `.so` (the earlier needed edit) or a link-arg `-l`; not attempted: all dyndeps results show the linking share is small, so the ceiling (webapp x0.79 at best; webapp's link share is the highest of the four) is low.
+
+## Other options (all with zero project edits)
+Edit time (leaf), ratio vs `split` [95% CI]:
+- `wild` linker (0.10.0 via `-B` shim, like mold): teamtype x0.658 [0.63,0.69], webapp x0.747 [0.73,0.79], agent_managers x0.878 [0.84,0.91], rustls x0.831 [0.80,0.87]; wide edits teamtype x0.710, rustls x0.868; cold x0.96-0.98 (CI includes 1 for 3 of 4); binary -1% to -2%; dir -0.2% to -0.6%. Beats mold in round 1 on every repo (rustls: mold x1.12 vs wild x0.83), but mold/wild were not run in the same round
+- `threads8` (`-Zthreads=8`, nightly flag via `RUSTC_BOOTSTRAP`): edit x0.98-1.06 (no gain), but cold x0.655 [0.62,0.69] webapp, x0.838 agent_managers, x0.905 teamtype, x0.924 rustls; no size change
+- nightly 1.101 (2026-10-22) vs stable `split_nightly`: edit x0.83-0.93 [CIs below 1 for 4 of 4: agent_managers .896-.979, rustls .797-.877, teamtype .799-.876, webapp .880-.960], target dir x0.73-0.84. Toolchain version, not a flag: confounded with 1.97.1 stable
+- `cranelift` (nightly backend): vs `split_nightly` edit x0.91 agent_managers, rustls ~x0.98 (vs split x0.83, vs split_nightly not in the table: see file), teamtype and webapp similar; binary x1.13-1.54 bigger; cold within CI of 1 (0.93 rustls); not a clear win over nightly alone
+- `noembed` (`-Zno-embed-metadata`): edit within CI of 1 except teamtype wide x0.92; target dir x0.73-0.85 on stable (equal to the nightly toolchain's dir shrink, so likely nightly cargo turns it on by default; not separated)
+- `nodebug` (`debug=false`): binary x0.58 (rustls), x0.76 (webapp), x0.79 (agent_managers), x0.93 (teamtype); dir x0.90-0.97; edit x0.94-1.00; loses line numbers in backtraces
+- `noinc` (incremental off): edit x1.2-3.5 slower, dir -7% to -22%. Never.
+- `sccache`: cold x1.02-1.28 (slower) on a miss; on a full hit cold is 0.46x-0.72x of the `sccache` miss (teamtype 26.6 s vs 41.2 s, webapp 4.7 s vs 15.6 s) but still x0.55-0.69 vs `split`... not computed vs `split` in CI form; edit x0.97-1.03 (no gain); dir unchanged. Value only for cold builds after `cargo clean` / across projects sharing deps (the cache hit time includes copying)
+- `combo_stable` = `dyndeps` + `wild`: edit teamtype x0.654 [0.63,0.70], webapp x0.788 [0.78,0.83], agent_managers x0.840 [0.81,0.94], rustls x0.917; cold x1.3-1.9; binary x0.43-0.84. Not better than `wild` alone for edits (teamtype 0.658), worse cold
+- `combo_boot` = + `-Zthreads=8`: edit teamtype x0.699, webapp x0.870; no better than `wild` alone
+
+Not measured: `hint-mostly-unused` (nightly; docs say it only helps crates with huge, mostly unused APIs, and `package."*"` is discouraged: https://blog.rust-lang.org/inside-rust/2025/07/15/call-for-testing-hint-mostly-unused), TPDE backend (planned 2027 per the Rust 2026 Fast Builds roadmap), `-Zshare-generics` (already default for debug), `panic=abort`/`strip` (change test/backtrace behaviour).
+
+## Deployable globally (transparent, stable, no project edits)
+- same recommended config as round 1, plus a linker choice: `wild` for edit speed (x0.66-0.88 vs lld, 4/4 repos, CIs below 1), via `-Clink-arg=-B<dir with ld->wild>` (needs a `-fuse-ld`-able driver trick, `-Clinker-features=-lld`, and a pinned wild binary; its README says to use GNU ld/lld for production, so keep it dev-profile only)
+- `debug=false` for the deps already there; `nodebug` for the app only if backtrace line numbers are not needed (artifact size lever, 7-42% smaller binary)
+- do not ship `dyndeps`, `-Zthreads` (nightly flag, only cold gains), `noinc`, `sccache` (unless cold rebuilds are common)
+- `cranelift`/nightly: nightly only, left as opt-in
+
+## Threats to validity (round 2)
+- same as round 1 (shared busy host, load 55-95, 5 trials, correlated edit samples so CIs are too narrow, one machine, appended-dead-fn edits, `test --no-run` n=1 and test binaries only loaded not run)
+- `wild`: one binary version (0.10.0, built earlier from the sibling repo's tools dir), wild is not a drop-in on all link lines; not tested on all binary kinds (cdylib, proc macros, `-Clink-self-contained`)
+- nightly/stable configs differ in toolchain AND cargo; `noembed` on stable used `RUSTC_BOOTSTRAP=1` (unsupported)
+- a `noembed` rustls binary timed out (>20 s) once under load before the harness fix; rerun then passed; the fix records timeouts as `run_rc=124` and `run.py` resumes finished trials
+- `dyndeps` correctness beyond these 4 workloads is unknown: crates with `links`/build-script-emitted `-l` flags, `#[no_mangle]`/`#[global_allocator]` in deps, duplicated statics across dylibs (each `.so` has its own copies of generics' statics; singleton/TLS issues possible) are untested; tests were only loaded, not executed
+- sccache config used a fresh per-trial cache dir, so "hit" times are best case
+- the `wild` and `dyndeps` ratios above were computed against a `split` run in the same shuffled round, but statistics ignore pairing
