@@ -138,3 +138,28 @@ Not measured: `hint-mostly-unused` (nightly; docs say it only helps crates with 
 - `dyndeps` correctness beyond these 4 workloads is unknown: crates with `links`/build-script-emitted `-l` flags, `#[no_mangle]`/`#[global_allocator]` in deps, duplicated statics across dylibs (each `.so` has its own copies of generics' statics; singleton/TLS issues possible) are untested; tests were only loaded, not executed
 - sccache config used a fresh per-trial cache dir, so "hit" times are best case
 - the `wild` and `dyndeps` ratios above were computed against a `split` run in the same shuffled round, but statistics ignore pairing
+
+# Round 3: wild correctness
+
+Question: does wild 0.10.0 (x86_64 release tarball, SHA-256 `641265506a7c06cfb03181b8916ab663ec8407855db6d4db7f8450667d105283`) break anything that the default linker (rustc 1.99.1 stable, rust-lld 23.1.1) does not?
+
+## Method
+- `scripts/wild_tests.sh REPO`: `git archive HEAD` copy under `/tmp`, isolated `CARGO_HOME` without config, separate target dir per linker, `cargo build` then `cargo test --workspace --offline --locked --no-fail-fast -j8` (dev profile, `RUST_BACKTRACE=1`), run under `nice` and `taskset` on 16 CPUs of a loaded host
+- wild is set through `RUSTFLAGS`, so build scripts and proc macros are also linked by wild (checked with `readelf -p .comment`: `Linker: Wild 0.10.0` vs `Linker: LLD 23.1.1`)
+- compared: sorted per-test outcome lines (`test X ... ok|FAILED|ignored`)
+- `fixture/` (own workspace: proc-macro derive, build script, cdylib, binary with a `#[should_panic]` and a real panic) with `fixture/check.sh default|wild`: tests, panic backtrace with `file:line`, gdb breakpoint on `main.rs:11` plus `bt`, `addr2line` on a symbol, cdylib loaded with `ctypes` and called
+- rust-analyzer 1.95.0 `analysis-stats .` with the toolchain proc-macro server, build scripts run by cargo with the same `RUSTFLAGS`, so proc macros and build-script output come from wild-linked binaries
+
+## Results
+- `agent_managers` (f8a48aa): 192 tests ok, 0 failed with both linkers, outcomes identical (186+6 passed, 2 ignored)
+- `teamtype` (f422ecf): 168 ok, 6 failed with both, outcomes identical; the 6 are the nvim e2e tests, failing identically under both because they need `./target/debug/teamtypev` at a fixed path; rerunning `-p e2e-tests` with that path linked: 6/6 pass with both linkers
+  - first run, a different test `peer::recovery_tests::tunnel_survives_blocked_relay_without_sync_peers` failed once under wild (`Error: deadline has elapsed`) and passed under default; rerun of the whole suite with wild passed it. Not reproduced, timing test on a host with load average ~75; only one sample each, so a wild-specific flake is not excluded
+- `rustls` (2b55f63f, `--exclude rustls-ci-bench`, which needs valgrind headers for `crabgrind`): 799 passed, 3 failed with both; the 3 are `raw_key_openssl_interop` tests (openssl tests, same failures with both linkers, cause not investigated). Per-test outcomes identical after discarding interleaved log lines
+- fixture: all checks give the same output with both linkers except addresses; backtrace frames, gdb source lines and `addr2line` resolve; proc macro, build script, cdylib work
+- rust-analyzer: `fixture`, `teamtype`, `agent_managers` give identical statistics with both linkers (panics 0; unresolved types `??ty` 0; same failed-MIR/const-eval counts, which come from r-a itself), proc-macro expansion worked in the fixture (derive-generated `S::answer()` resolved, build-script constant `GEN` evaluated)
+
+## Limits
+- one wild version, x86_64 only (aarch64 binary checksum recorded but not run); one machine
+- default and wild each ran the suites once (plus the reruns above)
+- tests do not prove runtime equivalence of every binary; `-Clink-self-contained`, static/musl targets, `--target` cross builds, and `cdylib`s beyond the fixture were not tested
+- wild's README still advises lld/GNU ld for production, hence dev profile only
